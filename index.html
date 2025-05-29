@@ -1,0 +1,886 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>WebXR Video Player - Enhanced 3D Stereo</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body { margin: 0; overflow: hidden; font-family: system-ui, sans-serif; background: #f0f2f5; }
+    #overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; flex-direction: column; justify-content: center; align-items: center; z-index: 9000; }
+    #start-button { padding: 15px 28px; font-size: 18px; background: rgba(255,255,255,0.9); color: black; border: none; border-radius: 16px; box-shadow: 0 4px 14px rgba(0,0,0,0.1); cursor: pointer; transition: all 0.2s; font-weight: 600; margin-bottom: 20px; }
+    #start-button:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(0,0,0,0.15); }
+    #file-input { display: none; }
+    #file-select { padding: 12px 24px; font-size: 16px; background: rgba(255,255,255,0.8); color: black; border: none; border-radius: 16px; box-shadow: 0 4px 14px rgba(0,0,0,0.1); cursor: pointer; transition: all 0.2s; margin-bottom: 10px; }
+    #file-select:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(0,0,0,0.15); }
+    #format-options { background: rgba(255,255,255,0.8); border-radius: 16px; padding: 15px; margin-top: 15px; text-align: center; }
+    #format-options h3 { margin-top: 0; }
+    #format-options label { margin: 5px 10px; display: inline-block; }
+    #session-type { background: rgba(255,255,255,0.9); border-radius: 16px; padding: 15px; margin-bottom: 15px; text-align: center; }
+    #session-type h3 { margin-top: 0; color: #333; }
+    #status { position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%); background: rgba(255,255,255,0.9); color: black; padding: 12px 24px; border-radius: 16px; font-size: 16px; font-weight: 500; display: none; z-index: 9999; }
+    .exit-ar { position: fixed; top: 20px; right: 20px; background: white; color: black; border: none; border-radius: 50%; width: 46px; height: 46px; display: none; align-items: center; justify-content: center; font-size: 24px; cursor: pointer; z-index: 9999; }
+    .xr-active .exit-ar { display: flex; }
+    video { display: block; width: 320px; height: 180px; margin: 20px auto; border-radius: 8px; }
+    .xr-active video { position: absolute; width: 1px; height: 1px; opacity: 0.01; }
+    #video-container { position: relative; margin: 20px auto; width: 320px; }
+  </style>
+</head>
+<body>
+  <div id="overlay">
+    <button id="start-button">Start Experience</button>
+    <label id="file-select" for="file-input">Choose a Video</label>
+    <input type="file" id="file-input" accept="video/*">
+    <div id="selected-file"></div>
+    
+    <div id="session-type">
+      <h3>Experience Mode</h3>
+      <div>
+        <label><input type="radio" name="session-type" value="vr" checked> VR Immersive</label>
+        <label><input type="radio" name="session-type" value="ar"> AR Passthrough</label>
+      </div>
+    </div>
+    
+    <div id="format-options">
+      <h3>Video Format</h3>
+      <div>
+        <label><input type="radio" name="video-type" value="360" checked> 360° Video</label>
+        <label><input type="radio" name="video-type" value="180"> 180° Video</label>
+        <label><input type="radio" name="video-type" value="2d"> 2D Panel</label>
+      </div>
+      <div>
+        <label><input type="radio" name="stereo-mode" value="mono" checked> Monoscopic</label>
+        <label><input type="radio" name="stereo-mode" value="sbs"> Side-by-Side Stereo</label>
+        <label><input type="radio" name="stereo-mode" value="tb"> Top-Bottom Stereo</label>
+      </div>
+    </div>
+    
+    <div id="video-container">
+      <video id="video" playsinline crossorigin="anonymous" controls></video>
+    </div>
+  </div>
+  <button class="exit-ar" id="exit-ar" aria-label="Exit XR">×</button>
+  <div id="status"></div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.150.1/build/three.module.js';
+
+    // Main variables
+    let camera, scene, renderer, videoMesh, controllers = [], xrSession = null;
+    let isPlaying = false;
+    let videoElement, videoTexture, videoMaterial, placeholderTexture;
+    let videoType = '360';
+    let stereoMode = 'mono';
+    let sessionType = 'vr';
+    let currentVideoURL = null;
+    
+    // Volume control variables
+    let currentVolume = 1.0;
+    let volumeControlActive = false;
+    let volumeFeedback = null;
+    const VOLUME_SENSITIVITY = 1.5;
+    
+    // Click sound variables
+    let audioContext;
+    let clickSound = null;
+    let lastClickTime = 0;
+    const CLICK_INTERVAL = 50;
+    let lastVolumeValue = 1.0;
+    const VOLUME_CLICK_THRESHOLD = 0.02;
+    
+    // Geometries - created once and reused
+    let sphereGeometry360, sphereGeometry180, planeGeometry2D;
+    
+    // Controller state for interactions
+    let controllerState = [
+      { 
+        isPressed: false, 
+        pressStartTime: 0, 
+        longPressActive: false, 
+        startPosition: null, 
+        currentPosition: null,
+        referenceRotation: new THREE.Euler(),
+        startRotation: new THREE.Euler(),
+        currentRotation: new THREE.Euler(),
+        activeControlMode: null,
+        wasPlayingBeforeScrub: false,
+        consecutiveScrubCount: 0,
+        lastScrubTime: 0,
+        scrubDirection: 0,
+        totalScrubDistance: 0
+      },
+      { 
+        isPressed: false, 
+        pressStartTime: 0, 
+        longPressActive: false, 
+        startPosition: null, 
+        currentPosition: null,
+        referenceRotation: new THREE.Euler(),
+        startRotation: new THREE.Euler(),
+        currentRotation: new THREE.Euler(),
+        activeControlMode: null,
+        wasPlayingBeforeScrub: false,
+        consecutiveScrubCount: 0,
+        lastScrubTime: 0,
+        scrubDirection: 0,
+        totalScrubDistance: 0
+      }
+    ];
+    const LONG_PRESS_THRESHOLD = 500;
+    const BASE_SCRUB_SENSITIVITY = 10;
+    const MAX_SCRUB_MULTIPLIER = 5;
+    const CONSECUTIVE_SCRUB_THRESHOLD = 15000; // 15 seconds
+    const SCRUB_SMOOTHING = 0.7;
+    let isScrubbing = false;
+    let scrubFeedback = null;
+    let arrowIndicators = [];
+    
+    // Setup renderer and scene
+    function init() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+      
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.xr.enabled = true;
+      renderer.setClearColor(0x000000, sessionType === 'ar' ? 0 : 1);
+      document.body.appendChild(renderer.domElement);
+
+      scene.add(new THREE.AmbientLight(0x404040));
+      
+      // Create placeholder texture
+      const placeholderData = new Uint8Array([128, 128, 128, 255, 128, 128, 128, 255, 128, 128, 128, 255, 128, 128, 128, 255]);
+      placeholderTexture = new THREE.DataTexture(placeholderData, 2, 2, THREE.RGBAFormat);
+      placeholderTexture.needsUpdate = true;
+      
+      // Create video element and texture
+      videoElement = document.getElementById('video');
+      videoTexture = new THREE.VideoTexture(videoElement);
+      videoTexture.minFilter = THREE.LinearFilter;
+      videoTexture.magFilter = THREE.LinearFilter;
+      videoTexture.format = THREE.RGBAFormat;
+      
+      // Initialize audio context
+      try {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        loadClickSound();
+      } catch(e) {
+        console.error("Web Audio API not supported:", e);
+      }
+      
+      // Pre-create geometries with enhanced settings for better 3D
+      sphereGeometry360 = new THREE.SphereGeometry(8, 64, 32, 0, Math.PI * 2, 0, Math.PI);
+      sphereGeometry180 = new THREE.SphereGeometry(8, 64, 32, Math.PI, Math.PI, 0, Math.PI);
+      planeGeometry2D = new THREE.PlaneGeometry(3.2, 1.8); // 16:9 aspect ratio
+      
+      // Initial material
+      videoMaterial = new THREE.MeshBasicMaterial({
+        map: placeholderTexture,
+        side: videoType === '2d' ? THREE.FrontSide : THREE.BackSide,
+      });
+      
+      // Create the video mesh with initial settings
+      createVideoMesh();
+      
+      // Event listeners
+      window.addEventListener('resize', onWindowResize);
+      document.getElementById('start-button').addEventListener('click', startXR);
+      document.getElementById('exit-ar').addEventListener('click', () => { if (xrSession) xrSession.end(); });
+      document.getElementById('file-input').addEventListener('change', handleFileSelect);
+      
+      // Session type listeners
+      document.querySelectorAll('input[name="session-type"]').forEach(input => {
+        input.addEventListener('change', (event) => {
+          sessionType = event.target.value;
+          renderer.setClearColor(0x000000, sessionType === 'ar' ? 0 : 1);
+        });
+      });
+      
+      // Format option listeners
+      document.querySelectorAll('input[name="video-type"]').forEach(input => {
+        input.addEventListener('change', (event) => {
+          videoType = event.target.value;
+          updateVideoGeometry();
+        });
+      });
+      
+      document.querySelectorAll('input[name="stereo-mode"]').forEach(input => {
+        input.addEventListener('change', (event) => {
+          stereoMode = event.target.value;
+          updateVideoMaterial();
+        });
+      });
+      
+      videoElement.addEventListener('loadeddata', () => {
+        updateVideoMaterial();
+        updateStatus(`Video loaded: ${videoElement.videoWidth}x${videoElement.videoHeight}`);
+        isPlaying = true;
+      });
+    }
+
+    function createVideoMesh() {
+      if (videoMesh) {
+        scene.remove(videoMesh);
+      }
+      
+      let geometry;
+      if (videoType === '360') {
+        geometry = sphereGeometry360;
+      } else if (videoType === '180') {
+        geometry = sphereGeometry180;
+      } else { // 2d
+        geometry = planeGeometry2D;
+      }
+      
+      videoMesh = new THREE.Mesh(geometry, videoMaterial);
+      
+      // Position 2D panel in front of user
+      if (videoType === '2d') {
+        videoMesh.position.set(0, 0, -2);
+      }
+      
+      scene.add(videoMesh);
+    }
+
+    function loadClickSound() {
+      fetch('click.ogg')
+        .then(response => response.arrayBuffer())
+        .then(arrayBuffer => audioContext.decodeAudioData(arrayBuffer))
+        .then(audioBuffer => {
+          clickSound = audioBuffer;
+        })
+        .catch(error => {
+          console.error("Error loading click sound:", error);
+        });
+    }
+    
+    function playClickSound() {
+      if (!clickSound || !audioContext) return;
+      
+      const now = Date.now();
+      if (now - lastClickTime < CLICK_INTERVAL) return;
+      
+      lastClickTime = now;
+      
+      const source = audioContext.createBufferSource();
+      source.buffer = clickSound;
+      
+      const gainNode = audioContext.createGain();
+      gainNode.gain.value = 0.5;
+      
+      source.connect(gainNode);
+      gainNode.connect(audioContext.destination);
+      
+      source.start(0);
+    }
+
+    function onWindowResize() {
+      if (camera) {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+      }
+      if (renderer) renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+    
+    function handleFileSelect(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      
+      document.getElementById('selected-file').textContent = `Selected: ${file.name}`;
+      
+      if (currentVideoURL) {
+        URL.revokeObjectURL(currentVideoURL);
+      }
+      
+      currentVideoURL = URL.createObjectURL(file);
+      
+      videoElement.src = currentVideoURL;
+      videoElement.autoplay = true;
+      videoElement.playsInline = true;
+      videoElement.volume = currentVolume;
+      
+      videoElement.play().catch(err => {
+        updateStatus('Playback failed: ' + err.message);
+      });
+      
+      updateVideoGeometry();
+    }
+    
+    function updateVideoGeometry() {
+      createVideoMesh();
+    }
+    
+    function updateVideoMaterial() {
+      if (stereoMode === 'mono') {
+        videoMaterial.map = videoTexture;
+        videoMaterial.side = videoType === '2d' ? THREE.FrontSide : THREE.BackSide;
+        
+        if (videoMaterial.type !== 'MeshBasicMaterial') {
+          const oldMaterial = videoMaterial;
+          videoMaterial = new THREE.MeshBasicMaterial({
+            map: videoTexture,
+            side: videoType === '2d' ? THREE.FrontSide : THREE.BackSide,
+          });
+          videoMesh.material = videoMaterial;
+          scheduleDisposal(oldMaterial);
+        }
+      } else {
+        // Create enhanced stereo shader with proper eye detection and IPD
+        const isSBS = stereoMode === 'sbs';
+        
+        if (videoMaterial.type !== 'ShaderMaterial') {
+          const oldMaterial = videoMaterial;
+          videoMaterial = new THREE.ShaderMaterial({
+            uniforms: {
+              map: { value: videoTexture },
+              viewMatrix: { value: new THREE.Matrix4() },
+              projectionMatrix: { value: new THREE.Matrix4() }
+            },
+            vertexShader: `
+              varying vec2 vUv;
+              varying vec4 vPosition;
+              uniform mat4 viewMatrix;
+              uniform mat4 projectionMatrix;
+              
+              void main() {
+                vUv = uv;
+                vPosition = projectionMatrix * viewMatrix * vec4(position, 1.0);
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+              }
+            `,
+            fragmentShader: `
+              uniform sampler2D map;
+              uniform mat4 viewMatrix;
+              varying vec2 vUv;
+              varying vec4 vPosition;
+              
+              void main() {
+                vec2 uv = vUv;
+                
+                // More reliable eye detection using view matrix translation
+                // WebXR provides different view matrices for each eye
+                float eyeOffset = viewMatrix[3][0]; // X translation from view matrix
+                bool isRightEye = eyeOffset > 0.001; // Small threshold to avoid floating point issues
+                
+                // Apply stereo mapping with proper IPD handling
+                if (${isSBS}) {
+                  // Side-by-side stereo - map each eye to its respective half
+                  if (isRightEye) {
+                    // Right eye - use right half of texture
+                    uv.x = uv.x * 0.5 + 0.5;
+                  } else {
+                    // Left eye - use left half of texture
+                    uv.x = uv.x * 0.5;
+                  }
+                } else {
+                  // Top-bottom stereo
+                  if (isRightEye) {
+                    // Right eye - use bottom half
+                    uv.y = uv.y * 0.5;
+                  } else {
+                    // Left eye - use top half
+                    uv.y = uv.y * 0.5 + 0.5;
+                  }
+                }
+                
+                vec4 color = texture2D(map, uv);
+                gl_FragColor = color;
+              }
+            `,
+            side: videoType === '2d' ? THREE.FrontSide : THREE.BackSide,
+            transparent: false
+          });
+          videoMesh.material = videoMaterial;
+          scheduleDisposal(oldMaterial);
+        }
+      }
+    }
+    
+    function scheduleDisposal(resource) {
+      if (!resource) return;
+      
+      const dispose = () => {
+        if (resource.dispose) resource.dispose();
+      };
+      
+      if (window.requestIdleCallback) {
+        window.requestIdleCallback(dispose);
+      } else {
+        setTimeout(dispose, 200);
+      }
+    }
+    
+    function startXR() {
+      if (!navigator.xr) {
+        updateStatus('WebXR not supported in this browser');
+        return;
+      }
+      
+      if (!videoElement.src) {
+        updateStatus('Please select a video file first');
+        return;
+      }
+      
+      const sessionMode = sessionType === 'ar' ? 'immersive-ar' : 'immersive-vr';
+      const sessionOptions = sessionType === 'ar' ? 
+        { optionalFeatures: ['hand-tracking'] } : 
+        { optionalFeatures: ['hand-tracking'] };
+      
+      navigator.xr.isSessionSupported(sessionMode)
+        .then(supported => {
+          if (supported) {
+            navigator.xr.requestSession(sessionMode, sessionOptions)
+              .then(onSessionStarted)
+              .catch(err => updateStatus(`Failed to start ${sessionType.toUpperCase()} session: ` + err.message));
+          } else {
+            updateStatus(`${sessionType.toUpperCase()} not supported on this device`);
+          }
+        })
+        .catch(err => {
+          updateStatus(`Error checking ${sessionType.toUpperCase()} support: ` + err.message);
+        });
+    }
+    
+    function onSessionStarted(session) {
+      xrSession = session;
+      document.getElementById('overlay').style.display = 'none';
+      document.body.classList.add('xr-active');
+      
+      renderer.xr.setReferenceSpaceType('local');
+      renderer.xr.setSession(session);
+      
+      if (audioContext && audioContext.state === 'suspended') {
+        audioContext.resume();
+      }
+      
+      // Setup controllers
+      controllers = [0, 1].map(i => {
+        const controller = renderer.xr.getController(i);
+        
+        controller.addEventListener('selectstart', () => handleControllerSelectStart(i));
+        controller.addEventListener('selectend', () => handleControllerSelectEnd(i));
+        
+        scene.add(controller);
+        return controller;
+      });
+      
+      createXRUI();
+      
+      renderer.setAnimationLoop(render);
+      
+      session.addEventListener('end', onSessionEnd);
+      
+      if (videoElement) {
+        videoElement.muted = false;
+        
+        if (!isPlaying && videoElement.paused && videoElement.src) {
+          playVideo();
+        }
+      }
+      
+      const modeText = sessionType === 'ar' ? 'AR Passthrough' : 'VR Immersive';
+      updateStatus(`${modeText} mode active! Enhanced 3D stereo enabled. Press trigger to play/pause.`);
+    }
+    
+    function handleControllerSelectStart(controllerIndex) {
+      const state = controllerState[controllerIndex];
+      state.isPressed = true;
+      state.pressStartTime = Date.now();
+      
+      state.startPosition = new THREE.Vector3();
+      controllers[controllerIndex].getWorldPosition(state.startPosition);
+      state.currentPosition = state.startPosition.clone();
+      
+      state.startRotation.setFromQuaternion(controllers[controllerIndex].quaternion);
+      state.currentRotation.copy(state.startRotation);
+      state.totalScrubDistance = 0;
+    }
+    
+    function handleControllerSelectEnd(controllerIndex) {
+      const state = controllerState[controllerIndex];
+      const pressDuration = Date.now() - state.pressStartTime;
+      
+      if (state.longPressActive) {
+        state.longPressActive = false;
+        
+        if (state.activeControlMode === 'scrub' && state.wasPlayingBeforeScrub) {
+          playVideo();
+        }
+        
+        isScrubbing = false;
+        volumeControlActive = false;
+        state.activeControlMode = null;
+        state.wasPlayingBeforeScrub = false;
+        state.totalScrubDistance = 0;
+        
+        // Hide all visual indicators
+        hideArrowIndicators();
+        if (volumeFeedback) volumeFeedback.visible = false;
+        
+        updateStatus(`Control ended. Current volume: ${Math.round(currentVolume * 100)}%`);
+      } else if (pressDuration < LONG_PRESS_THRESHOLD) {
+        if (isPlaying) {
+          videoElement.pause();
+          isPlaying = false;
+          updateStatus('Video paused');
+        } else {
+          playVideo();
+        }
+      }
+      
+      state.isPressed = false;
+      state.pressStartTime = 0;
+      state.startPosition = null;
+      state.currentPosition = null;
+    }
+    
+    function handleControllerInput(controllerIndex) {
+      const state = controllerState[controllerIndex];
+      
+      if (state.isPressed) {
+        const pressDuration = Date.now() - state.pressStartTime;
+        
+        if (pressDuration >= LONG_PRESS_THRESHOLD && !state.longPressActive) {
+          state.longPressActive = true;
+          
+          const newPosition = new THREE.Vector3();
+          controllers[controllerIndex].getWorldPosition(newPosition);
+          state.currentPosition = newPosition;
+          
+          state.currentRotation.setFromQuaternion(controllers[controllerIndex].quaternion);
+          state.referenceRotation.copy(state.currentRotation);
+          lastVolumeValue = currentVolume;
+          
+          updateStatus('Control active - move controller up/down to scrub, rotate wrist for volume');
+        }
+        
+        if (state.longPressActive) {
+          const newPosition = new THREE.Vector3();
+          controllers[controllerIndex].getWorldPosition(newPosition);
+          state.currentPosition = newPosition;
+          
+          state.currentRotation.setFromQuaternion(controllers[controllerIndex].quaternion);
+          
+          const verticalDelta = state.currentPosition.y - state.startPosition.y;
+          const rotationDelta = state.currentRotation.z - state.referenceRotation.z;
+          
+          if (state.activeControlMode === null) {
+            if (Math.abs(verticalDelta) > 0.02) {
+              state.activeControlMode = 'scrub';
+              state.wasPlayingBeforeScrub = isPlaying;
+              state.scrubDirection = (verticalDelta > 0) ? 1 : -1;
+            } else if (Math.abs(rotationDelta) > 0.03) {
+              state.activeControlMode = 'volume';
+            }
+          }
+          
+          if (state.activeControlMode === 'scrub') {
+            isScrubbing = true;
+            volumeControlActive = false;
+            
+            const currentTime = Date.now();
+            
+            // Reset consecutive scrub count if too much time has passed
+            if (currentTime - state.lastScrubTime > CONSECUTIVE_SCRUB_THRESHOLD) {
+              state.consecutiveScrubCount = 0;
+            }
+            
+            if (currentTime - state.lastScrubTime < CONSECUTIVE_SCRUB_THRESHOLD) {
+              state.consecutiveScrubCount = Math.min(MAX_SCRUB_MULTIPLIER, state.consecutiveScrubCount + 1);
+            } else {
+              state.consecutiveScrubCount = 1;
+            }
+            
+            state.lastScrubTime = currentTime;
+            
+            if (Math.abs(verticalDelta) > 0.02) {
+              if (isPlaying) {
+                videoElement.pause();
+                isPlaying = false;
+              }
+              
+              // Determine scrub direction for visual feedback
+              const currentScrubDirection = verticalDelta > 0 ? 1 : -1;
+              state.scrubDirection = currentScrubDirection;
+              
+              // Show directional arrows
+              showArrowIndicators(currentScrubDirection);
+              if (volumeFeedback) volumeFeedback.visible = false;
+              
+              let adjustedVerticalDelta = verticalDelta;
+              if (Math.abs(verticalDelta) < 0.05 && state.scrubDirection !== 0) {
+                adjustedVerticalDelta = (state.scrubDirection > 0) ? 
+                    Math.max(0.05, verticalDelta) : 
+                    Math.min(-0.05, verticalDelta);
+              }
+              
+              const dynamicSensitivity = BASE_SCRUB_SENSITIVITY * state.consecutiveScrubCount;
+              const scrubAmount = adjustedVerticalDelta * dynamicSensitivity;
+              
+              let targetTime = videoElement.currentTime + scrubAmount;
+              let newTime = videoElement.currentTime + (targetTime - videoElement.currentTime) * SCRUB_SMOOTHING;
+              
+              newTime = Math.max(0, Math.min(videoElement.duration, newTime));
+              videoElement.currentTime = newTime;
+              
+              updateStatus(`Scrubbing ${currentScrubDirection > 0 ? 'forward' : 'backward'}: ${formatTime(newTime)} / ${formatTime(videoElement.duration)} (x${state.consecutiveScrubCount})`);
+              
+              state.startPosition = state.currentPosition.clone();
+            }
+          } 
+          else if (state.activeControlMode === 'volume') {
+            volumeControlActive = true;
+            isScrubbing = false;
+            
+            // Hide arrows and show volume indicator
+            hideArrowIndicators();
+            
+            if (Math.abs(rotationDelta) > 0.03) {
+              const volumeChange = -rotationDelta * VOLUME_SENSITIVITY;
+              let newVolume = currentVolume + volumeChange;
+              
+              newVolume = Math.max(0, Math.min(1, newVolume));
+              
+              if (Math.abs(newVolume - lastVolumeValue) >= VOLUME_CLICK_THRESHOLD) {
+                playClickSound();
+                lastVolumeValue = newVolume;
+              }
+              
+              currentVolume = newVolume;
+              videoElement.volume = currentVolume;
+              
+              updateStatus(`Volume: ${Math.round(currentVolume * 100)}%`);
+              
+              if (volumeFeedback) {
+                volumeFeedback.visible = true;
+                volumeFeedback.scale.y = Math.max(0.1, currentVolume);
+                volumeFeedback.position.y = (currentVolume - 0.5) * 0.5;
+              }
+              
+              state.referenceRotation.copy(state.currentRotation);
+            }
+          }
+        }
+      }
+    }
+    
+    function createXRUI() {
+      // Create visual feedback for volume control
+      volumeFeedback = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.2, 1),
+        new THREE.MeshBasicMaterial({
+          color: 0xffffff,
+          transparent: true,
+          opacity: 0.5
+        })
+      );
+      volumeFeedback.position.set(0, 0, -2);
+      volumeFeedback.visible = false;
+      volumeFeedback.scale.y = currentVolume;
+      scene.add(volumeFeedback);
+      
+      // Create arrow indicators for scrubbing direction
+      createArrowIndicators();
+    }
+    
+    function createArrowIndicators() {
+      arrowIndicators = [];
+      
+      // Create arrow geometry (triangle pointing up)
+      const arrowGeometry = new THREE.ConeGeometry(0.1, 0.2, 3);
+      const arrowMaterial = new THREE.MeshBasicMaterial({
+        color: 0xffffff,
+        transparent: true,
+        opacity: 0.8
+      });
+      
+      // Create two arrows side by side
+      for (let i = 0; i < 2; i++) {
+        const arrow = new THREE.Mesh(arrowGeometry, arrowMaterial.clone());
+        arrow.position.set((i - 0.5) * 0.4, 0, -2); // Side by side
+        arrow.visible = false;
+        arrowIndicators.push(arrow);
+        scene.add(arrow);
+      }
+    }
+    
+    function showArrowIndicators(direction) {
+      arrowIndicators.forEach((arrow, index) => {
+        arrow.visible = true;
+        // Direction: 1 = forward (up arrows), -1 = backward (down arrows)
+        if (direction > 0) {
+          // Forward scrubbing - arrows point up
+          arrow.rotation.x = 0;
+        } else {
+          // Backward scrubbing - arrows point down
+          arrow.rotation.x = Math.PI;
+        }
+      });
+    }
+    
+    function hideArrowIndicators() {
+      arrowIndicators.forEach(arrow => {
+        arrow.visible = false;
+      });
+    }
+    
+    function onSessionEnd() {
+      document.getElementById('overlay').style.display = 'flex';
+      document.body.classList.remove('xr-active');
+      document.getElementById('status').style.display = 'none';
+      
+      if (videoElement) {
+        videoElement.pause();
+        isPlaying = false;
+      }
+      
+      // Reset controller states
+      controllerState.forEach(state => {
+        state.isPressed = false;
+        state.pressStartTime = 0;
+        state.longPressActive = false;
+        state.startPosition = null;
+        state.currentPosition = null;
+        state.activeControlMode = null;
+        state.wasPlayingBeforeScrub = false;
+        state.consecutiveScrubCount = 0;
+        state.lastScrubTime = 0;
+        state.scrubDirection = 0;
+        state.totalScrubDistance = 0;
+      });
+      
+      hideArrowIndicators();
+      if (volumeFeedback) volumeFeedback.visible = false;
+      
+      renderer.setAnimationLoop(null);
+      xrSession = null;
+      
+      scheduleCleanupResources();
+    }
+    
+    function scheduleCleanupResources() {
+      const cleanupResources = () => {
+        for (let controller of controllers) {
+          scene.remove(controller);
+        }
+        controllers = [];
+        
+        hideArrowIndicators();
+        if (volumeFeedback) volumeFeedback.visible = false;
+      };
+      
+      if (window.requestIdleCallback) {
+        window.requestIdleCallback(cleanupResources);
+      } else {
+        setTimeout(cleanupResources, 200);
+      }
+    }
+    
+    function playVideo() {
+      if (videoElement && videoElement.src) {
+        videoElement.muted = false;
+        
+        videoElement.play()
+          .then(() => {
+            isPlaying = true;
+            updateStatus('Playing video with audio');
+          })
+          .catch(error => {
+            updateStatus('Error playing video: ' + error.message);
+            
+            if (!videoElement.muted) {
+              updateStatus('Trying muted playback, tap screen to enable audio');
+              videoElement.muted = true;
+              videoElement.play()
+                .then(() => {
+                  isPlaying = true;
+                  updateStatus('Playing video (muted). Tap to enable audio.');
+                })
+                .catch(err => {
+                  updateStatus('Playback failed completely: ' + err.message);
+                });
+            }
+          });
+      }
+    }
+    
+    function formatTime(seconds) {
+      const mins = Math.floor(seconds / 60);
+      const secs = Math.floor(seconds % 60);
+      return `${mins}:${secs.toString().padStart(2, '0')}`;
+    }
+    
+    function render(timestamp, frame) {
+      // Update shader uniforms for stereo materials
+      if (videoMaterial && videoMaterial.type === 'ShaderMaterial' && frame) {
+        // Get the current view matrix from the WebXR frame
+        const viewerPose = frame.getViewerPose(renderer.xr.getReferenceSpace());
+        if (viewerPose) {
+          // Update view matrix uniform with the current eye's view matrix
+          const currentView = viewerPose.views[renderer.xr.isPresenting ? 
+            (timestamp % 2 === 0 ? 0 : 1) : 0]; // Alternate between eyes
+          if (currentView) {
+            videoMaterial.uniforms.viewMatrix.value.fromArray(currentView.transform.inverse.matrix);
+            videoMaterial.uniforms.projectionMatrix.value.fromArray(currentView.projectionMatrix);
+          }
+        }
+      }
+      
+      // Handle controller input
+      for (let i = 0; i < controllers.length; i++) {
+        if (controllerState[i].isPressed) {
+          handleControllerInput(i);
+        }
+      }
+      
+      // Update 2D panel position to follow user in AR mode
+      if (sessionType === 'ar' && videoType === '2d' && videoMesh) {
+        // Keep 2D panel in front of user in AR
+        const cameraDirection = new THREE.Vector3(0, 0, -1);
+        cameraDirection.applyQuaternion(camera.quaternion);
+        cameraDirection.multiplyScalar(2);
+        
+        const targetPosition = new THREE.Vector3().copy(camera.position).add(cameraDirection);
+        videoMesh.position.lerp(targetPosition, 0.1);
+        videoMesh.lookAt(camera.position);
+      }
+      
+      if (videoTexture) videoTexture.needsUpdate = true;
+      
+      renderer.render(scene, camera);
+    }
+    
+    function updateStatus(message) {
+      const statusElement = document.getElementById('status');
+      statusElement.textContent = message;
+      statusElement.style.display = 'block';
+      
+      if (!message.toLowerCase().includes('error') && 
+          !message.toLowerCase().includes('not supported') &&
+          !message.toLowerCase().includes('failed')) {
+        setTimeout(() => { statusElement.style.display = 'none'; }, 3000);
+      }
+    }
+    
+    function cleanup() {
+      if (currentVideoURL) {
+        URL.revokeObjectURL(currentVideoURL);
+      }
+      
+      if (xrSession) {
+        xrSession.end();
+      }
+      
+      if (audioContext) {
+        audioContext.close();
+      }
+      
+      scheduleCleanupResources();
+    }
+    
+    window.addEventListener('beforeunload', cleanup);
+    
+    // Initialize app
+    init();
+  </script>
+</body>
+</html>
